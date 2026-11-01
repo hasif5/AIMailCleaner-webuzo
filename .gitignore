@@ -1,0 +1,13 @@
+# AI Mail Cleaner — this tree doubles as the live install (/usr/local/mailcleaner).
+# Runtime state lives in /var/lib/mailcleaner, never here.
+mailcleaner-*.tar.gz
+mailcleaner-*.tar.gz.sha256
+*.tmp
+*.tmp.*
+*.bak
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/
+error_log

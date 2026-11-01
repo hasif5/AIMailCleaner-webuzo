@@ -1,0 +1,11 @@
+{
+	"name":"AI Mail Cleaner",
+	"slug":"mailcleaner",
+	"version":"1.0.0",
+	"author": "<a href=\"https:\/\/www.digitalbkk.com\">Digitalbkk Co., Ltd.<\/a>",
+	"requires": "4.0.0",
+	"compatibility": [],
+	"license": "Apache-2.0",
+	"last_updated": "2026-11-01",
+	"homepage":"https:\/\/github.com\/hasif5\/AIMailCleaner-webuzo"
+}
