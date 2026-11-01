@@ -21,7 +21,7 @@ $claim = $argv[1] ?? '';
 $slot  = (int)($argv[2] ?? 0);
 if(strpos($claim, MC_SPOOL.'/') !== 0 || strpos($claim, '..') !== false || !is_file($claim)) exit(2);
 
-$slotfh = fopen(MC_LOCKS.'/slot-'.$slot.'.lock', 'c');
+$slotfh = fopen(MC_LOCKS.'/slot-'.$slot.'.lock', 'ce');
 if(!$slotfh || !flock($slotfh, LOCK_EX)) exit(3);
 
 $job = mc_load_json($claim);
@@ -51,7 +51,7 @@ function mc_ready_or_test($prov, $s){
 $box = mc_load_box($email);
 if(!$box) exit(0);
 
-$lock = fopen(MC_LOCKS.'/'.$email.'.lock', 'c');
+$lock = fopen(MC_LOCKS.'/'.$email.'.lock', 'ce');
 if(!$lock || !flock($lock, LOCK_EX | LOCK_NB)){
 	// someone is already working on this mailbox: put the job back for later
 	mc_save_json(MC_SPOOL.'/'.$email.'.json', $job, 0600);

@@ -64,7 +64,7 @@ Cost: about $0.002 per message the AI reads with `gemini-3.8-flash`. Most mail n
 Download the latest release from the [Releases page](https://github.com/hasif5/AIMailCleaner-webuzo/releases), then:
 
 ```bash
-tar xzf mailcleaner-1.0.0.tar.gz
+tar xzf mailcleaner-1.0.1.tar.gz
 sudo ./mailcleaner/install.sh
 ```
 

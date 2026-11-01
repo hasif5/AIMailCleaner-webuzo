@@ -1,7 +1,7 @@
 {
 	"name":"AI Mail Cleaner",
 	"slug":"mailcleaner",
-	"version":"1.0.0",
+	"version":"1.0.1",
 	"author": "<a href=\"https:\/\/www.digitalbkk.com\">Digitalbkk Co., Ltd.<\/a>",
 	"requires": "4.0.0",
 	"compatibility": [],

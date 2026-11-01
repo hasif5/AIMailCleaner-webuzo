@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1 — 2026-11-01
+
+- Fix: a long-running check inherited the runner's lock. That blocked checks for other mailboxes until it finished, and made the health check report a stalled runner. Lock files are now opened close-on-exec.
+
 ## 1.0.0 — 2026-11-01
 
 First public release.

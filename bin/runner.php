@@ -17,7 +17,7 @@ const MC_SLOTS = 3;   // mailboxes worked on at the same time (protects a shared
 if(posix_getuid() !== 0){ fwrite(STDERR, "runner must run as root\n"); exit(1); }
 umask(0077);   // state files are root-only from the moment they exist
 
-$g = fopen(MC_LOCKS.'/runner.lock', 'c');
+$g = fopen(MC_LOCKS.'/runner.lock', 'ce');
 if(!$g || !flock($g, LOCK_EX | LOCK_NB)) exit(0);
 @touch(MC_STATE.'/.heartbeat');
 
@@ -60,7 +60,7 @@ do {
 exit(0);
 
 function mc_box_locked($email){
-	$fh = @fopen(MC_LOCKS.'/'.$email.'.lock', 'c');
+	$fh = @fopen(MC_LOCKS.'/'.$email.'.lock', 'ce');
 	if(!$fh) return true;
 	$free = flock($fh, LOCK_EX | LOCK_NB);
 	if($free) flock($fh, LOCK_UN);
@@ -71,7 +71,7 @@ function mc_box_locked($email){
 function mc_free_slot($launched){
 	for($i = 0; $i < MC_SLOTS; $i++){
 		if(isset($launched[$i]) && time() - $launched[$i] < 15) continue;
-		$fh = @fopen(MC_LOCKS.'/slot-'.$i.'.lock', 'c');
+		$fh = @fopen(MC_LOCKS.'/slot-'.$i.'.lock', 'ce');
 		if(!$fh) continue;
 		$free = flock($fh, LOCK_EX | LOCK_NB);
 		if($free) flock($fh, LOCK_UN);
