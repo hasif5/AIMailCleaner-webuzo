@@ -25,8 +25,9 @@ done
 LOOSE=$(find "$STATE" -maxdepth 1 -type f ! -perm 0600 2>/dev/null | wc -l)
 (( LOOSE == 0 )) && ok "state files 0600" || bad "$LOOSE state file(s) not 0600"
 "$PHP" -r 'require "/usr/local/mailcleaner/lib/common.php"; $s = mc_settings();
-	echo "  ".($s["gemini_key"] !== "" ? "\033[32mok\033[0m    Gemini key set (".$s["gemini_model"].", main AI)" : "\033[33mnote\033[0m  no Gemini key: REQUIRED, AI is off until it is saved (SpamAssassin only)")."\n";
-	echo "  ".($s["anthropic_key"] !== "" ? "\033[32mok\033[0m    Claude key set (".$s["anthropic_model"].", effort ".$s["anthropic_effort"].", second opinion ".($s["second"] === "none" ? "switched off" : $s["second_when"]).")" : "\033[32mok\033[0m    no Claude key (optional): Gemini decides alone")."\n";
+	$role = function($p) use ($s){ return $s["primary"] === $p ? "main AI" : ($s["second"] === $p ? "second opinion ".$s["second_when"] : "not used"); };
+	echo "  ".($s["gemini_key"] !== "" ? "\033[32mok\033[0m    Gemini key set (".$s["gemini_model"].", ".$role("gemini").")" : "\033[33mnote\033[0m  no Gemini key: REQUIRED (the default main AI)")."\n";
+	echo "  ".($s["anthropic_key"] !== "" ? "\033[32mok\033[0m    Claude key set (".$s["anthropic_model"].", effort ".$s["anthropic_effort"].", ".$role("anthropic").")" : "\033[32mok\033[0m    no Claude key (optional): Gemini decides alone")."\n";
 	echo "  \033[32mok\033[0m    mailboxes set up: ".count(mc_all_boxes())."\n";'
 command -v spamc >/dev/null && ok "spamc present" || note "spamc missing: messages without a SpamAssassin header cannot be scored"
 [[ -f "$STATE/.paused" ]] && note "PAUSED by the administrator"

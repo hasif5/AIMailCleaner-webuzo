@@ -84,9 +84,11 @@ if($is_post){
 		if(in_array($e, array('low', 'medium', 'high'), true)) $s['anthropic_effort'] = $e;
 		$g = mc_post('gemini_thinking');
 		if(in_array($g, array('low', 'medium', 'high'), true)) $s['gemini_thinking'] = $g;
-		$s['primary'] = 'gemini';
+		$pr = mc_post('primary');
+		// Claude can be the main AI only while its key is saved; Gemini is the default.
+		$s['primary'] = ($pr === 'anthropic' && $s['anthropic_key'] !== '') ? 'anthropic' : 'gemini';
 		$se = mc_post('second');
-		if(in_array($se, array('anthropic', 'none'), true)) $s['second'] = $se;
+		if(in_array($se, array('other', 'none'), true)) $s['second'] = $se === 'none' ? 'none' : mc_ai_other($s['primary']);
 		$sw = mc_post('second_when');
 		if(in_array($sw, array('unsure', 'always'), true)) $s['second_when'] = $sw;
 		$ub = (float)mc_post('unsure_below');
@@ -163,11 +165,16 @@ card('<i class="fas fa-robot me-2"></i>AI providers', 'Keys are stored root-only
 echo '<form method="post" action="?act=save" autocomplete="off">';
 mc_tok_field();
 
-if($s['gemini_key'] === '') note('<b>Gemini API key required.</b> Gemini is the AI that checks mail. Until its key is saved, only SpamAssassin is used (and Claude is not asked either).', 'warn');
+if($s['gemini_key'] === '') note('<b>Gemini API key required.</b> Gemini is the default AI that checks mail. Until its key is saved, only SpamAssassin is used (and Claude is not asked either, unless you make Claude the main AI below).', 'warn');
 
+$role = function($p) use ($s){
+	if($s['primary'] === $p) return '<span class="mc-pill mc-pill-run"><span>main AI</span></span>';
+	if($s['second'] === $p && $s[$p.'_key'] !== '') return '<span class="mc-pill"><span>second opinion</span></span>';
+	return '';
+};
 $provinfo = array(
-	'gemini'    => array('Google Gemini <span class="mc-pill mc-pill-run"><span>required &middot; main AI</span></span>', 'aistudio.google.com → Get API key (use a project with billing turned on: on the free tier Google may use what you send to improve its products)', 'gemini_thinking', 'Thinking level', array('low' => 'low', 'medium' => 'medium (default)', 'high' => 'high')),
-	'anthropic' => array('Anthropic Claude <span class="mc-pill"><span>optional &middot; second opinion</span></span>', 'console.anthropic.com → API keys. Leave empty to use Gemini alone.', 'anthropic_effort', 'Effort', array('low' => 'low', 'medium' => 'medium', 'high' => 'high (recommended)')),
+	'gemini'    => array('Google Gemini <span class="mc-pill"><span>required &middot; default</span></span> '.$role('gemini'), 'aistudio.google.com → Get API key (use a project with billing turned on: on the free tier Google may use what you send to improve its products)', 'gemini_thinking', 'Thinking level', array('low' => 'low', 'medium' => 'medium (default)', 'high' => 'high')),
+	'anthropic' => array('Anthropic Claude <span class="mc-pill"><span>optional</span></span> '.$role('anthropic'), 'console.anthropic.com → API keys. Leave empty to use Gemini alone.', 'anthropic_effort', 'Effort', array('low' => 'low', 'medium' => 'medium', 'high' => 'high (recommended)')),
 );
 foreach($provinfo as $p => $pi){
 	$key = $s[$p.'_key'];
@@ -205,18 +212,25 @@ foreach($provinfo as $p => $pi){
 	echo '</div>';
 }
 
-echo '<h3 class="mc-h3">Second opinion from Claude</h3><div class="row">'
-	.'<div class="col-md-4"><label class="form-label" for="se">Use Claude</label><select class="form-select form-control" id="se" name="second">'
-	.'<option value="anthropic"'.($s['second'] === 'anthropic' ? ' selected' : '').'>yes, when a Claude key is saved</option>'
-	.'<option value="none"'.($s['second'] === 'none' ? ' selected' : '').'>no, Gemini only</option></select></div>'
-	.'<div class="col-md-4"><label class="form-label" for="sw">Ask Claude</label><select class="form-select form-control" id="sw" name="second_when">'
-	.'<option value="unsure"'.($s['second_when'] === 'unsure' ? ' selected' : '').'>only when Gemini is unsure, says phishing, or fails</option>'
+$main = mc_ai_name($s['primary']); $other = mc_ai_name(mc_ai_other($s['primary']));
+$has_claude = $s['anthropic_key'] !== '';
+echo '<h3 class="mc-h3">Which AI decides</h3><div class="row">'
+	.'<div class="col-md-3"><label class="form-label" for="pr">Main AI</label><select class="form-select form-control" id="pr" name="primary">'
+	.'<option value="gemini"'.($s['primary'] === 'gemini' ? ' selected' : '').'>Gemini (default)</option>'
+	.'<option value="anthropic"'.($s['primary'] === 'anthropic' ? ' selected' : '').($has_claude ? '' : ' disabled').'>Claude'.($has_claude ? '' : ' (save a Claude key first)').'</option></select></div>'
+	.'<div class="col-md-3"><label class="form-label" for="se">Second opinion</label><select class="form-select form-control" id="se" name="second">'
+	.'<option value="other"'.($s['second'] !== 'none' ? ' selected' : '').'>yes, from the other AI</option>'
+	.'<option value="none"'.($s['second'] === 'none' ? ' selected' : '').'>no, main AI only</option></select></div>'
+	.'<div class="col-md-3"><label class="form-label" for="sw">Ask the second AI</label><select class="form-select form-control" id="sw" name="second_when">'
+	.'<option value="unsure"'.($s['second_when'] === 'unsure' ? ' selected' : '').'>only when the main AI is unsure, says phishing, or fails</option>'
 	.'<option value="always"'.($s['second_when'] === 'always' ? ' selected' : '').'>on every message (about double the calls)</option></select></div>'
-	.'<div class="col-md-4"><label class="form-label" for="ub">"Unsure" means Gemini is below</label><select class="form-select form-control" id="ub" name="unsure_below">';
+	.'<div class="col-md-3"><label class="form-label" for="ub">"Unsure" means below</label><select class="form-select form-control" id="ub" name="unsure_below">';
 foreach(array('0.7' => '70%', '0.8' => '80%', '0.9' => '90%', '0.95' => '95%') as $val => $lab) echo '<option value="'.$val.'"'.(abs((float)$s['unsure_below'] - (float)$val) < 0.001 ? ' selected' : '').'>'.$lab.'</option>';
 echo '</select></div></div>'
-	.'<div class="hint mt-2">Gemini checks every message that goes to AI. When Claude also answers, a message is only moved on its own if <b>both</b> say spam or phishing; if they disagree, the owner decides. '
-	.'If Gemini fails (error, cap reached), Claude is used as a fallback. Without a Claude key, Gemini decides alone.</div>';
+	.'<div class="hint mt-2">Now: <b>'.h($main).'</b> checks every message that goes to AI and suggests folders'
+	.($s['second'] !== 'none' && $s[mc_ai_other($s['primary']).'_key'] !== '' ? '; <b>'.h($other).'</b> gives the second opinion.' : '; no second opinion.')
+	.' You can switch the main AI any time; it applies from the next check. When both answer, a message is only moved on its own if <b>both</b> say spam or phishing; if they disagree, the owner decides. '
+	.'If the main AI fails (error, cap reached), the other one is used as a fallback.</div>';
 
 echo '<h3 class="mc-h3">Limits</h3><div class="row">'
 	.'<div class="col-md-4"><label class="form-label" for="pc">Characters of the message text sent</label><input class="form-control" type="number" min="300" max="6000" step="100" id="pc" name="preview_chars" value="'.(int)$s['preview_chars'].'"></div>'

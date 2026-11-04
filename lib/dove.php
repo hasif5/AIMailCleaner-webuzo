@@ -82,6 +82,19 @@ function mc_dove_headers($email, $folder, $from_uid = 1){
 	return $rows;
 }
 
+// GUIDs of every message in a folder (for "N not checked yet"), or null.
+function mc_dove_guids($email, $folder){
+	$rc = mc_exec(array(MC_DOVEADM, '-f', 'tab', 'fetch', '-u', $email, 'guid', 'mailbox', $folder, 'all'), $out, $err, null, 120);
+	if($rc !== 0) return null;
+	$g = array();
+	foreach(explode("\n", $out) as $i => $l){
+		$l = trim($l);
+		if($l === '' || ($i === 0 && $l === 'guid')) continue;   // tab format starts with a header line
+		$g[] = $l;
+	}
+	return $g;
+}
+
 /**
  * Raw RFC 822 message (or its first $max bytes). doveadm's pager format prints
  * "text:\n" followed by the message.
@@ -165,10 +178,15 @@ function mc_decode_header($v){
 }
 
 // SpamAssassin score from X-Spam-Score or "score=N" inside X-Spam-Status. null if absent.
+// SpamAssassin score from the delivery headers. X-Spam-Status "score=2.3" is the
+// real score and wins. Exim (Webuzo, cPanel, DirectAdmin) writes X-Spam-Score as
+// $spam_score_int, the score times ten ("23" = 2.3), so a bare integer there is
+// divided by ten; a value with a decimal point is taken as-is.
 function mc_sa_from_headers($score, $status){
-	$score = trim((string)$score);
-	if($score !== '' && preg_match('~^[-+]?[0-9]+(\.[0-9]+)?~', $score, $m)) return (float)$m[0];
 	if(preg_match('~score=([-+]?[0-9]+(?:\.[0-9]+)?)~', (string)$status, $m)) return (float)$m[1];
+	$score = trim((string)$score);
+	if($score !== '' && preg_match('~^[-+]?[0-9]+\.[0-9]+~', $score, $m)) return (float)$m[0];
+	if($score !== '' && preg_match('~^[-+]?[0-9]+$~', $score)) return ((int)$score) / 10;
 	return null;
 }
 

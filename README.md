@@ -2,7 +2,7 @@
 
 **Powered by [Digitalbkk Co., Ltd.](https://www.digitalbkk.com) — developed by the Digitalbkk team. Author: Hasif Ahmed <hasif5@gmail.com>**
 
-A free, open-source Webuzo v4 plugin that finds spam and phishing in your mailboxes, and helps you file everything else into the right folder. It uses SpamAssassin plus AI (Google Gemini, with Anthropic Claude as an optional second opinion).
+A free, open-source Webuzo v4 plugin that finds spam and phishing in your mailboxes, and helps you file everything else into the right folder. It uses SpamAssassin plus AI: Google Gemini by default, with Anthropic Claude as an optional second opinion. The server owner can make Claude the main AI at any time.
 
 - **Nothing is ever deleted.** Spam goes to a folder of its own, and every move can be undone.
 - **You decide.** A check builds a list. Nothing moves until you press **Apply**, unless you switch on automatic moving.
@@ -16,8 +16,9 @@ A free, open-source Webuzo v4 plugin that finds spam and phishing in your mailbo
 1. **Check.** The owner presses **Check now**. Every new message is scored by SpamAssassin (the score already in its headers, or `spamc` when there is none).
    - At or above *certainly spam* (default 8): marked as spam, no AI call.
    - Below *unsure* (default 5): looks fine, no AI call.
-   - In between: Gemini reads a short digest of the message and decides. Optionally, Claude gives a second opinion when Gemini is unsure, says phishing, or fails.
-2. **Review.** Messages are shown in four tabs: **Spam · Unsure · Looks fine · Done**. Each message has one choice: **Spam folder**, **Leave where it is**, or **one of your folders**. Spam is pre-selected, and "Set all to…" changes a whole tab at once.
+   - The page first shows how many messages have not been checked yet. You can check only the **newest N** (default 500), and **stop** a running check at any time: what is done is kept for review and the rest waits for the next check.
+   - In between: the main AI (Gemini by default, or Claude if the owner chooses) reads a short digest of the message and decides. Optionally, the other AI gives a second opinion when the main one is unsure, says phishing, or fails.
+2. **Review.** Messages are shown in four tabs: **Spam · Unsure · Looks fine · Done**. Each message has one-click buttons: **Spam**, **Keep**, **Archive**, the **AI's pick**, folders you already used in this check, and a box to type any folder name (a new one is created on Apply). Spam is pre-selected. For big checks, tick messages (or **select all matching** a filter) and use **Set selected to…** to move hundreds at once, including into a **new folder** you name. You can filter by sender, subject, current choice or AI suggestion, or click a sender to see only their mail.
 3. **AI tools (optional).**
    - **Suggest folders:** the AI picks an existing folder for each message that is not going to spam (for example a Microsoft notice into `Microsoft`, an AWS support case into `Amazon Web Services/AWS Support`), or proposes a new folder. Its picks are pre-selected for you to confirm. A new folder is only created when you press Apply.
    - **Check again:** asks the AI again about the spam verdicts, for example after adding a key.
@@ -52,8 +53,8 @@ Automatic checks only look at mail that arrives after they are switched on.
 
 - Webuzo v4 with Dovecot (`doveadm`) and the bundled EMPS PHP (curl, pdo_sqlite)
 - `spamc` (SpamAssassin), for messages without a SpamAssassin header
-- A **Google Gemini API key** (required). Use a key from a Google Cloud project **with billing enabled**: on the free tier Google may use what you send to improve its products.
-- An **Anthropic API key** (optional, for the second opinion)
+- A **Google Gemini API key** (required; Gemini is the default main AI). Use a key from a Google Cloud project **with billing enabled**: on the free tier Google may use what you send to improve its products.
+- An **Anthropic API key** (optional: for the second opinion, or to make Claude the main AI)
 
 Cost: about $0.002 per message the AI reads with `gemini-3.8-flash`. Most mail never reaches the AI because SpamAssassin is already sure about it. The admin page has a monthly spending cap per provider and a usage table.
 
@@ -64,7 +65,7 @@ Cost: about $0.002 per message the AI reads with `gemini-3.8-flash`. Most mail n
 Download the latest release from the [Releases page](https://github.com/hasif5/AIMailCleaner-webuzo/releases), then:
 
 ```bash
-tar xzf mailcleaner-1.0.1.tar.gz
+tar xzf mailcleaner-1.1.0.tar.gz
 sudo ./mailcleaner/install.sh
 ```
 
@@ -77,7 +78,7 @@ sudo /usr/local/mailcleaner/install.sh
 
 Then:
 
-1. Open the **admin panel → AI Mail Cleaner**. Paste the Gemini key (and the Claude key if you want the second opinion), save, and press **Test Gemini**.
+1. Open the **admin panel → AI Mail Cleaner**. Paste the Gemini key (and the Claude key if you want the second opinion), save, and press **Test Gemini**. Under **Which AI decides** you can switch the main AI between Gemini and Claude whenever you like.
 2. In the **user panel → Email → AI Mail Cleaner**, set up a mailbox and press **Check now**.
 
 The installer:

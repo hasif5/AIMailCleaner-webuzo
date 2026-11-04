@@ -169,8 +169,8 @@ function mc_default_settings(){
 		'gemini_key'       => '',
 		'gemini_model'     => 'gemini-3.8-flash',
 		'gemini_thinking'  => 'medium',        // low | medium | high
-		'primary'          => 'gemini',        // fixed: Gemini is the main AI (its key is required)
-		'second'           => 'anthropic',     // anthropic | none — Claude is an optional second opinion
+		'primary'          => 'gemini',        // gemini (default, key required) | anthropic — the main AI
+		'second'           => 'anthropic',     // the other provider | none — second opinion and fallback
 		'second_when'      => 'unsure',        // unsure | always
 		'unsure_below'     => 0.80,            // primary confidence below this => ask second
 		'cap_anthropic'    => 150.0,           // USD per calendar month, 0 = no cap
@@ -187,13 +187,18 @@ function mc_settings(){
 	$s = mc_load_json(MC_SETTINGS);
 	if(!is_array($s)) $s = array();
 	$s = array_merge(mc_default_settings(), $s);
-	// Roles are fixed: Gemini decides, Claude (if a key is set) is the second opinion.
-	$s['primary'] = 'gemini';
-	if($s['second'] !== 'none') $s['second'] = 'anthropic';
+	// Gemini is the default main AI; the owner may switch the main AI to Claude.
+	// Claude can only be main while its key is saved, otherwise Gemini takes over.
+	// The second opinion is always the other provider (or none).
+	if($s['primary'] !== 'anthropic' || (string)$s['anthropic_key'] === '') $s['primary'] = 'gemini';
+	if($s['second'] !== 'none') $s['second'] = mc_ai_other($s['primary']);
 	return $s;
 }
 
 function mc_save_settings($s){ return mc_save_json(MC_SETTINGS, $s, 0600); }
+
+function mc_ai_other($p){ return $p === 'anthropic' ? 'gemini' : 'anthropic'; }
+function mc_ai_name($p){ return $p === 'anthropic' ? 'Claude' : 'Gemini'; }
 
 // "sk-ant-…a1b2" style display; the full key is never sent to a browser.
 function mc_mask_key($k){
@@ -337,6 +342,13 @@ function mc_queue_job($email, $kind, $extra = array()){
 }
 
 function mc_queued($email){ return is_file(MC_SPOOL.'/'.$email.'.json'); }
+
+// "Stop" for a running check / recheck / sort: the worker looks for this flag
+// between batches, keeps everything finished so far, and ends normally.
+function mc_stop_file($email){ return MC_LOCKS.'/'.$email.'.stop'; }
+function mc_request_stop($email){ return mc_valid_email($email) && @touch(mc_stop_file($email)); }
+function mc_stop_requested($email){ clearstatcache(true, mc_stop_file($email)); return is_file(mc_stop_file($email)); }
+function mc_clear_stop($email){ @unlink(mc_stop_file($email)); }
 
 function mc_status($email){
 	$s = mc_load_json(MC_STATUS.'/'.$email.'.json');

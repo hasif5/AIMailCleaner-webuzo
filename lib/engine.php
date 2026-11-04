@@ -11,7 +11,7 @@
  * Nothing here deletes mail. Moves go through doveadm and are verified.
  */
 
-define('MC_CHUNK', 40);   // messages prepared + classified per batch (progress granularity)
+define('MC_CHUNK', 20);   // messages per batch: progress granularity and how soon Stop takes effect
 
 class McLog {
 	private $fh = null;
@@ -38,6 +38,58 @@ function mc_spamc_score($raw){
 	// -c: prints "score/threshold"; exit 1 = spam, 0 = ham, anything else = error
 	if(($rc === 0 || $rc === 1) && preg_match('~^\s*([-+]?[0-9]+(?:\.[0-9]+)?)/~', $out, $m)) return (float)$m[1];
 	return null;
+}
+
+// spamd children kept free for live mail delivery: spamd runs -m5 on Webuzo.
+define('MC_SPAMC_PARALLEL', 3);
+
+/**
+ * Score several messages at once ($msgs: idx => row with folder/uid).
+ * Returns idx => float score (missing idx = could not be scored).
+ * Each message is read from Dovecot just before its spamc starts, so at most
+ * MC_SPAMC_PARALLEL message bodies are held in memory.
+ */
+function mc_spamc_many($email, $msgs){
+	$bin = is_executable('/usr/bin/spamc') ? '/usr/bin/spamc' : (is_executable('/bin/spamc') ? '/bin/spamc' : '');
+	$res = array();
+	if($bin === '') return $res;
+	$env = array('PATH' => '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'LANG' => 'C.UTF-8', 'HOME' => '/root');
+	foreach(array_chunk($msgs, MC_SPAMC_PARALLEL, true) as $group){
+		$run = array();
+		foreach($group as $i => $m){
+			$raw = mc_dove_raw($email, $m['folder'], $m['uid']);
+			if($raw === null) continue;
+			$pipes = array();
+			$p = @proc_open(array($bin, '-c', '-x', '-s', '1000000'), array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes, '/tmp', $env);
+			if(!is_resource($p)) continue;
+			// spamc reads its whole input before it talks to spamd, so a blocking write is safe.
+			$len = strlen($raw);
+			for($o = 0; $o < $len; $o += 65536){ if(@fwrite($pipes[0], substr($raw, $o, 65536)) === false) break; }
+			fclose($pipes[0]);
+			unset($raw);
+			stream_set_blocking($pipes[1], false); stream_set_blocking($pipes[2], false);
+			$run[$i] = array($p, $pipes, '');
+		}
+		$deadline = microtime(true) + 90;
+		while($run && microtime(true) < $deadline){
+			$r = array();
+			foreach($run as $i => $x){ $r[] = $x[1][1]; $r[] = $x[1][2]; }
+			$w = null; $e = null;
+			if(@stream_select($r, $w, $e, 1, 0) === false) break;
+			foreach($run as $i => $x){
+				$o = fread($x[1][1], 8192); if($o !== false && $o !== '') $run[$i][2] .= $o;
+				fread($x[1][2], 8192);
+				if(feof($x[1][1]) && feof($x[1][2])){
+					fclose($x[1][1]); fclose($x[1][2]);
+					$rc = proc_close($x[0]);
+					if(($rc === 0 || $rc === 1) && preg_match('~^\s*([-+]?[0-9]+(?:\.[0-9]+)?)/~', $run[$i][2], $mm)) $res[$i] = (float)$mm[1];
+					unset($run[$i]);
+				}
+			}
+		}
+		foreach($run as $x){ proc_terminate($x[0], 9); fclose($x[1][1]); fclose($x[1][2]); proc_close($x[0]); }
+	}
+	return $res;
 }
 
 /* ------------------------------------------------------------- decisions */
@@ -88,6 +140,8 @@ function mc_scan($box, $job, $run, $log){
 	$st = mc_status($email);
 	$incremental = !empty($job['incremental']);
 	$max = max(50, min(50000, (int)$s['max_per_run']));
+	$limit = (int)($job['limit'] ?? 0);                 // "check the newest N" from the panel
+	if($limit > 0) $max = min($max, $limit);
 	$preview = max(300, min(6000, (int)$s['preview_chars']));
 	$primary = $s['primary'];
 	$ai_on = ($primary !== 'none' && mc_ai_ready($primary, $s));
@@ -142,7 +196,7 @@ function mc_scan($box, $job, $run, $log){
 	// newest first, so a capped run looks at what matters most
 	usort($cands, function($a, $b){ return $b['uid'] <=> $a['uid']; });
 	$skipped_cap = max(0, count($cands) - $max);
-	if($skipped_cap) $log('  '.$skipped_cap.' older messages left for the next scan (limit '.$max.' per run)');
+	if($skipped_cap) $log('  '.$skipped_cap.' older messages left for the next check ('.($limit > 0 ? 'you asked for the newest '.$max : 'limit '.$max.' per check').')');
 	$cands = array_slice($cands, 0, $max);
 	$total = count($cands);
 
@@ -154,10 +208,25 @@ function mc_scan($box, $job, $run, $log){
 		.' v1_prov, v1_model, v1_verdict, v1_conf, v1_reason, v2_prov, v2_model, v2_verdict, v2_conf, v2_reason, decision, why, pick)'
 		.' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
 
+	$stopped = false;
 	for($off = 0; $off < $total; $off += MC_CHUNK){
+		if(mc_stop_requested($email)){
+			$stopped = true;
+			$tot['stopped'] = time();
+			$tot['left_for_next'] += $total - $off;
+			$log('Stopped at your request after '.$off.' of '.$total.'. Everything checked so far is kept; the other '.($total - $off).' are left for the next check.');
+			break;
+		}
 		$chunk = array_slice($cands, $off, MC_CHUNK);
 		$prep = array();     // idx => row with decision fields
 		$ask = array();      // idx => user_text for the AI
+
+		// SpamAssassin for messages without a score header: several spamc at once.
+		$need = array();
+		foreach($chunk as $i => $m){
+			if($m['sa'] === null && !mc_allowed(mc_addr($m['sender']), $box['allow'])) $need[$i] = $m;
+		}
+		$pre = $need ? mc_spamc_many($email, $need) : array();
 
 		foreach($chunk as $i => $m){
 			$m['sa_src'] = $m['sa'] !== null ? 'header' : null;
@@ -170,8 +239,7 @@ function mc_scan($box, $job, $run, $log){
 			}
 			$raw = null;
 			if($m['sa'] === null){
-				$raw = mc_dove_raw($email, $m['folder'], $m['uid']);
-				$sc = $raw !== null ? mc_spamc_score($raw) : null;
+				$sc = $pre[$i] ?? null;
 				if($sc === null){ $m['sa_src'] = 'error'; $tot['sa_error']++; }
 				else { $m['sa'] = $sc; $m['sa_src'] = 'spamc'; $tot['sa_spamc']++; }
 			}else{
@@ -244,7 +312,9 @@ function mc_scan($box, $job, $run, $log){
 		$log('  '.$tot['looked'].'/'.$total.' checked — move '.$tot['move'].', review '.$tot['review'].', keep '.$tot['keep']);
 	}
 
-	mc_write_status($email, array('folders' => $fstate));
+	// A stopped check leaves the per-folder position alone, so automatic checks
+	// still see the messages it did not reach.
+	if(!$stopped) mc_write_status($email, array('folders' => $fstate));
 	$log('Done: '.$tot['looked'].' checked. Move '.$tot['move'].', needs your look '.$tot['review'].', keep '.$tot['keep']
 		.'. SpamAssassin: '.$tot['sa_header'].' from headers, '.$tot['sa_spamc'].' scored now'.($tot['sa_error'] ? ', '.$tot['sa_error'].' failed' : '')
 		.'. AI calls: '.$tot['ai1'].($tot['ai2'] ? ' + '.$tot['ai2'].' second opinions' : '').($tot['ai_err'] ? ' ('.$tot['ai_err'].' without an answer)' : '').'.');
@@ -268,7 +338,7 @@ function mc_recheck($box, $scan_run, $scope, $log){
 	$run = mc_db_run($scan_run);
 	if(!$run || $run['box'] !== $email || $run['kind'] !== 'scan') throw new RuntimeException('check not found');
 	$primary = $s['primary'];
-	if($primary === 'none' || !mc_ai_ready($primary, $s)) throw new RuntimeException('AI is not set up on this server (no Gemini key)');
+	if($primary === 'none' || !mc_ai_ready($primary, $s)) throw new RuntimeException('AI is not set up on this server (no API key for the main AI)');
 	$preview = max(300, min(6000, (int)$s['preview_chars']));
 
 	$where = $scope === 'all' ? "decision IN ('move','review','keep')" : "decision IN ('move','review')";
@@ -287,6 +357,7 @@ function mc_recheck($box, $scan_run, $scope, $log){
 		.' decision=?, why=?, pick=? WHERE id = ? AND action IS NULL');
 
 	for($off = 0; $off < $total; $off += MC_CHUNK){
+		if(mc_stop_requested($email)){ $tot['stopped'] = time(); $log('Stopped at your request after '.$off.' of '.$total.'. The new answers finished so far are kept.'); break; }
 		$chunk = array_slice($rows, $off, MC_CHUNK);
 		$ask = array();
 		foreach($chunk as $i => $m){
@@ -382,7 +453,7 @@ function mc_sort($box, $scan_run, $log){
 	$run = mc_db_run($scan_run);
 	if(!$run || $run['box'] !== $email || $run['kind'] !== 'scan') throw new RuntimeException('check not found');
 	$primary = $s['primary'];
-	if($primary === 'none' || !mc_ai_ready($primary, $s)) throw new RuntimeException('AI is not set up on this server (no Gemini key)');
+	if($primary === 'none' || !mc_ai_ready($primary, $s)) throw new RuntimeException('AI is not set up on this server (no API key for the main AI)');
 	$preview = max(300, min(6000, (int)$s['preview_chars']));
 
 	$all = mc_dove_folders($email);
@@ -405,6 +476,7 @@ function mc_sort($box, $scan_run, $log){
 	$names = array_keys($targets);
 
 	for($off = 0; $off < $total; $off += MC_CHUNK){
+		if(mc_stop_requested($email)){ $tot['stopped'] = time(); $log('Stopped at your request after '.$off.' of '.$total.'. The folder suggestions finished so far are kept.'); break; }
 		$chunk = array_slice($rows, $off, MC_CHUNK);
 		$ask = array();
 		foreach($chunk as $i => $m){
@@ -647,6 +719,22 @@ function mc_restore_one($box, $msg_id, $log){
 	$log('Putting back "'.$rows[0]['subject'].'"');
 	$res = mc_restore_rows($box, $rows, $log);
 	$log($res['restored'] ? 'Put back.' : 'Could not put it back.');
+	return $res;
+}
+
+// Put back a chosen set of moved or filed messages (bulk "Put back").
+function mc_restore_many($box, array $ids, $log){
+	$ids = array_values(array_filter(array_map('intval', $ids)));
+	if(!$ids){ $log('Nothing to put back.'); return array('restored' => 0, 'failed' => 0); }
+	$rows = array();
+	foreach(array_chunk($ids, 500) as $chunk){
+		$q = mc_db()->prepare("SELECT id, run, folder, guid, subject, action FROM msgs WHERE box = ? AND action IN ('moved', 'filed') AND id IN (".implode(',', $chunk).')');
+		$q->execute(array($box['email']));
+		$rows = array_merge($rows, $q->fetchAll());
+	}
+	$log('Putting back '.count($rows).' message(s)');
+	$res = mc_restore_rows($box, $rows, $log);
+	$log('Put back '.$res['restored'].($res['failed'] ? ', '.$res['failed'].' could not be put back' : '').'.');
 	return $res;
 }
 

@@ -68,6 +68,7 @@ mc_db_run_start($run, $email, $kind, $trig, $parent);
 mc_write_status($email, array('state' => 'working', 'kind' => $kind, 'run' => $run, 'started' => time(),
 	'heartbeat' => time(), 'progress' => array('done' => 0, 'total' => 0, 'phase' => 'starting'), 'error' => ''));
 
+mc_clear_stop($email);   // a Stop pressed for an earlier job must not end this one
 $final = 'done'; $err = ''; $tot = array(); $view_run = $run;
 try {
 	if($kind === 'scan'){
@@ -118,7 +119,7 @@ try {
 		$tot = mc_undo($box, $parent, $log);
 		$view_run = $parent;
 	}elseif($kind === 'restore'){
-		$tot = mc_restore_one($box, (int)($job['msg'] ?? 0), $log);
+		$tot = (isset($job['msgs']) && is_array($job['msgs'])) ? mc_restore_many($box, $job['msgs'], $log) : mc_restore_one($box, (int)($job['msg'] ?? 0), $log);
 		$view_run = $parent ?: $run;
 	}
 } catch(Throwable $t){
@@ -134,6 +135,7 @@ $patch = array('state' => $final === 'failed' ? 'failed' : 'idle', 'finished' =>
 if($kind === 'scan') $patch['last_scan'] = $run;
 if($kind === 'scan' && $trig === 'auto') $patch['last_auto'] = time();
 mc_write_status($email, $patch);
+mc_clear_stop($email);
 
 // keep the 40 newest logs per mailbox
 $logs = glob(MC_LOGS.'/'.$email.'/*.log') ?: array();

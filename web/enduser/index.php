@@ -268,6 +268,29 @@ if($act === 'poll' && !$is_post){
 		'view' => $st['last']['view'] ?? ''));
 }
 
+// How many messages in the mailbox's checked folders have never been looked at.
+if($act === 'count' && !$is_post){
+	list($email, $box) = mc_require_box(mc_get('box'));
+	if(!$box) mc_json(array('ok' => false));
+	require_once MC_BASE.'/lib/dove.php';
+	$known = array();
+	$q = mc_db()->prepare('SELECT guid FROM msgs WHERE box = ?');
+	$q->execute(array($email));
+	while($r = $q->fetch()) $known[$r['guid']] = true;
+	$out = array(); $sum = 0; $all = 0;
+	$prefix = mc_dove_prefix(mc_dove_folders($email));
+	foreach($box['folders'] as $f){
+		if($f === $box['review_folder']) continue;
+		$g = mc_dove_guids($email, $f);
+		if($g === null) continue;
+		$n = 0;
+		foreach($g as $x){ if(!isset($known[$x])) $n++; }
+		$out[] = array('folder' => mc_folder_display($f, $prefix), 'total' => count($g), 'unchecked' => $n);
+		$sum += $n; $all += count($g);
+	}
+	mc_json(array('ok' => true, 'unchecked' => $sum, 'total' => $all, 'folders' => $out));
+}
+
 if($act === 'pick' && $is_post){
 	mc_check_csrf(true);
 	list($email, $box) = mc_require_box(mc_post('box'));
@@ -292,14 +315,23 @@ if($act === 'choose' && $is_post){
 	$m = $q->fetch();
 	if(!$m) mc_json(array('ok' => false, 'error' => 'That message was already handled. Reload the page.'), 409);
 	$v = mc_post('v');
+	if($v === '__archive') $v = mc_archive_folder($email, $box);
+	elseif($v === '__new'){
+		$v = mc_typed_folder($email, $box, mc_post('name'));
+		if($v === '') mc_json(array('ok' => false, 'error' => 'That folder name cannot be used. Use letters, numbers and spaces, at most two levels (e.g. Clients/Acme). Inbox, Sent, Drafts, Trash, Junk and Spam are not allowed.'), 400);
+	}
 	if($v === '__spam') $set = array(1, null);
 	elseif($v === '__leave') $set = array(0, null);
 	else {
-		if(!mc_choice_ok($email, $box, $v, $m)) mc_json(array('ok' => false, 'error' => 'That folder cannot be used.'), 400);
+		$t = mc_targets_for($email, $box);
+		$typed = in_array(mc_post('v'), array('__new', '__archive'), true);
+		if(!$typed && !mc_choice_ok($email, $box, $v, $m, $run_id)) mc_json(array('ok' => false, 'error' => 'That folder cannot be used.'), 400);
 		$set = array(0, $v);
 	}
 	mc_db()->prepare('UPDATE msgs SET pick = ?, dest = ? WHERE id = ?')->execute(array($set[0], $set[1], $id));
-	mc_json(array('ok' => true) + mc_plan_counts($run_id, $email));
+	$isnew = $set[1] !== null && !in_array($set[1], mc_targets_for($email, $box)['all'], true);
+	mc_json(array('ok' => true, 'value' => $set[1] ?? $v, 'label' => $set[1] !== null ? mc_folder_display($set[1], mc_targets_for($email, $box)['prefix']) : '', 'isnew' => $isnew)
+		+ mc_plan_counts($run_id, $email));
 }
 
 /* ------------------------------------------------------------------ POST actions */
@@ -352,10 +384,23 @@ if($is_post){
 		@unlink(MC_STATUS.'/'.$email.'.json');
 		mc_redirect('?act=list&removed=1');
 	}
+	if($act === 'stop'){
+		// Not started yet: just take it off the queue. Running: ask the worker to stop
+		// after the current batch; everything finished so far is kept.
+		if(mc_queued($email) && @unlink(MC_SPOOL.'/'.$email.'.json')){
+			mc_write_status($email, array('state' => 'idle', 'progress' => null, 'error' => ''));
+			mc_redirect('?act=box&box='.rawurlencode($email).'&cancelled=1');
+		}
+		if($busy) mc_request_stop($email);
+		mc_redirect('?act=box&box='.rawurlencode($email).'&stopping=1');
+	}
 	if($busy) mc_stop('Busy', 'This mailbox is already being worked on. Wait until that has finished.', 409);
 
 	if($act === 'scan'){
-		mc_queue_job($email, 'scan', array('trigger' => 'manual', 'by' => $user));
+		$lim = trim(mc_post('limit'));
+		$extra = array('trigger' => 'manual', 'by' => $user);
+		if($lim !== '' && ctype_digit($lim) && (int)$lim >= 1) $extra['limit'] = min(50000, (int)$lim);
+		mc_queue_job($email, 'scan', $extra);
 		mc_write_status($email, array('state' => 'working', 'kind' => 'scan', 'run' => '', 'started' => time(), 'heartbeat' => time(),
 			'progress' => array('done' => 0, 'total' => 0, 'phase' => 'queued'), 'error' => ''));
 		mc_redirect('?act=box&box='.rawurlencode($email).'&started=1');
@@ -363,26 +408,55 @@ if($is_post){
 	$run_id = mc_post('run');
 	$run = mc_require_run($run_id, $email);
 
-	if($act === 'setall'){
-		// "Set all shown to": one choice for every open message in the current tab.
+	if($act === 'bulk' || $act === 'putback'){
+		// Bulk: the ticked messages (ids) or every message matching the current filters.
 		$tab = mc_post('tab');
-		$where = mc_tab_where($tab);
-		if($where === null || $tab === 'done') mc_stop('Bad request', 'Unknown list.', 400);
-		$v = mc_post('v');
-		$db = mc_db();
-		$base = ' WHERE run = ? AND box = ? AND action IS NULL AND '.$where;
-		if($v === '__spam') $db->prepare('UPDATE msgs SET pick = 1, dest = NULL'.$base)->execute(array($run_id, $email));
-		elseif($v === '__leave') $db->prepare('UPDATE msgs SET pick = 0, dest = NULL'.$base)->execute(array($run_id, $email));
-		elseif($v === '__ai') $db->prepare("UPDATE msgs SET pick = 0, dest = sug_folder".$base." AND sug_kind IN ('existing','new') AND sug_folder IS NOT NULL")->execute(array($run_id, $email));
-		else {
-			if(!mc_choice_ok($email, $box, $v, null)) mc_stop('Bad request', 'That folder cannot be used.', 400);
-			$db->prepare('UPDATE msgs SET pick = 0, dest = ?'.$base)->execute(array($v, $run_id, $email));
+		if(mc_tab_where($tab) === null) mc_stop('Bad request', 'Unknown list.', 400);
+		$f = mc_filter_in($_POST);
+		list($where, $par) = mc_filter($run_id, $email, $tab, $f);
+		if(mc_post('scope') !== 'all'){
+			$ids = array();
+			foreach(explode(',', mc_post('ids')) as $i){ $i = (int)$i; if($i > 0) $ids[$i] = $i; }
+			if(!$ids) mc_redirect('?act=run&box='.rawurlencode($email).'&run='.rawurlencode($run_id).'&tab='.rawurlencode($tab).mc_filter_qs($f));
+			if(count($ids) > 20000) mc_stop('Too many', 'Select fewer messages, or use "select all matching".', 400);
+			$where .= ' AND id IN ('.implode(',', array_values($ids)).')';
 		}
-		mc_redirect('?act=run&box='.rawurlencode($email).'&run='.rawurlencode($run_id).'&tab='.rawurlencode($tab));
+		$db = mc_db();
+		$back = '?act=run&box='.rawurlencode($email).'&run='.rawurlencode($run_id).'&tab='.rawurlencode($tab).mc_filter_qs($f);
+
+		if($act === 'putback'){
+			$q = $db->prepare("SELECT id FROM msgs WHERE ".$where." AND action IN ('moved','filed')");
+			$q->execute($par);
+			$ids = array_map('intval', $q->fetchAll(PDO::FETCH_COLUMN));
+			if(!$ids) mc_redirect($back);
+			mc_queue_job($email, 'restore', array('run' => $run_id, 'msgs' => $ids, 'by' => $user));
+			mc_write_status($email, array('state' => 'working', 'kind' => 'restore', 'run' => '', 'started' => time(), 'heartbeat' => time(),
+				'progress' => array('done' => 0, 'total' => count($ids), 'phase' => 'queued'), 'error' => ''));
+			mc_redirect('?act=box&box='.rawurlencode($email).'&started=1');
+		}
+
+		if($tab === 'done') mc_stop('Bad request', 'Those messages were already handled.', 400);
+		$v = mc_post('v');
+		if($v === '__archive') $v = mc_archive_folder($email, $box);
+		elseif($v === '__new'){
+			$v = mc_typed_folder($email, $box, mc_post('newname'));
+			if($v === '') mc_stop('Folder name not allowed', 'Use letters, numbers and spaces (at most two levels, e.g. "Clients/Acme"). Inbox, Sent, Drafts, Trash, Junk and Spam cannot be used.', 400);
+		}
+		$base = ' WHERE '.$where.' AND action IS NULL';
+		if($v === '__spam') $st = $db->prepare('UPDATE msgs SET pick = 1, dest = NULL'.$base);
+		elseif($v === '__leave') $st = $db->prepare('UPDATE msgs SET pick = 0, dest = NULL'.$base);
+		elseif($v === '__ai') $st = $db->prepare("UPDATE msgs SET pick = 0, dest = sug_folder".$base." AND sug_kind IN ('existing','new') AND sug_folder IS NOT NULL");
+		else {
+			if(!in_array(mc_post('v'), array('__new', '__archive'), true) && !mc_choice_ok($email, $box, $v, null, $run_id)) mc_stop('Bad request', 'That folder cannot be used.', 400);
+			$st = $db->prepare('UPDATE msgs SET pick = 0, dest = ?'.$base);
+			array_unshift($par, $v);
+		}
+		$st->execute($par);
+		mc_redirect($back.'&set='.$st->rowCount());
 	}
 	if($act === 'sort'){
 		if($run['kind'] !== 'scan') mc_stop('Bad request', 'Only a check can be sorted.', 400);
-		if(!mc_ai_on()) mc_stop('AI is not set up', 'The server administrator has not added a Gemini API key yet.', 409);
+		if(!mc_ai_on()) mc_stop('AI is not set up', 'The server administrator has not added an AI key yet.', 409);
 		mc_queue_job($email, 'sort', array('run' => $run_id, 'by' => $user));
 		mc_write_status($email, array('state' => 'working', 'kind' => 'sort', 'run' => '', 'started' => time(), 'heartbeat' => time(),
 			'progress' => array('done' => 0, 'total' => 0, 'phase' => 'queued'), 'error' => ''));
@@ -401,7 +475,7 @@ if($is_post){
 	}
 	if($act === 'recheck'){
 		if($run['kind'] !== 'scan') mc_stop('Bad request', 'Only a check can be rechecked.', 400);
-		if(!mc_ai_on()) mc_stop('AI is not set up', 'The server administrator has not added a Gemini API key yet.', 409);
+		if(!mc_ai_on()) mc_stop('AI is not set up', 'The server administrator has not added an AI key yet.', 409);
 		mc_queue_job($email, 'recheck', array('run' => $run_id, 'scope' => mc_post('scope') === 'all' ? 'all' : 'unsure', 'by' => $user));
 		mc_write_status($email, array('state' => 'working', 'kind' => 'recheck', 'run' => '', 'started' => time(), 'heartbeat' => time(),
 			'progress' => array('done' => 0, 'total' => 0, 'phase' => 'queued'), 'error' => ''));
@@ -455,18 +529,86 @@ function mc_targets_for($email, $box){
 
 // A folder choice is allowed if it is one of the owner's ordinary folders, or the
 // new folder the AI suggested for this message (already sanitised by the worker).
-function mc_choice_ok($email, $box, $v, $m){
+function mc_choice_ok($email, $box, $v, $m, $run_id = null){
 	if(!is_string($v) || !mc_valid_folder($v)) return false;
 	$t = mc_targets_for($email, $box);
 	if(in_array($v, $t['targets'], true)) return true;
-	if($m && ($m['sug_kind'] ?? '') === 'new' && ($m['sug_folder'] ?? '') === $v && !in_array($v, $t['all'], true)) return true;
-	if(!$m){
-		// bulk: allow any AI-suggested new folder of this mailbox
-		$q = mc_db()->prepare("SELECT 1 FROM msgs WHERE box = ? AND sug_kind = 'new' AND sug_folder = ? LIMIT 1");
-		$q->execute(array($email, $v));
-		return (bool)$q->fetchColumn() && !in_array($v, $t['all'], true);
-	}
+	if(in_array($v, $t['all'], true)) return false;                 // Inbox, Sent, Trash, spam folder...
+	if($m && ($m['sug_kind'] ?? '') === 'new' && ($m['sug_folder'] ?? '') === $v) return true;
+	// a new folder already chosen (by the AI or the owner) for some message of this check
+	if($run_id !== null) return in_array($v, mc_pending_new($email, $box, $run_id), true);
 	return false;
+}
+
+// The mailbox's Archive folder: an existing top-level "Archive"/"Archives", else a new "Archive".
+function mc_archive_folder($email, $box){
+	$t = mc_targets_for($email, $box);
+	foreach($t['targets'] as $disp => $full) if(preg_match('~^archives?$~i', $disp)) return $full;
+	return $t['prefix'].'Archive';
+}
+
+// A folder name typed by the owner ("Clients/Acme") -> full folder name, or '' if not allowed.
+function mc_typed_folder($email, $box, $name){
+	require_once MC_BASE.'/lib/dove.php';
+	$t = mc_targets_for($email, $box);
+	$name = trim((string)$name);
+	foreach($t['targets'] as $disp => $full) if(strcasecmp($disp, $name) === 0) return $full;     // existing, any case
+	$full = mc_folder_from_display($name, $t['all']);
+	if($full === '') return '';
+	if(in_array($full, $t['all'], true) && !in_array($full, $t['targets'], true)) return '';   // Inbox, Sent, spam folder...
+	return $full;
+}
+
+// New folders (not created yet) that this check's messages are set to, or the AI proposed.
+function mc_pending_new($email, $box, $run_id){
+	static $cache = array();
+	if(isset($cache[$run_id])) return $cache[$run_id];
+	$t = mc_targets_for($email, $box);
+	$q = mc_db()->prepare("SELECT dest AS f FROM msgs WHERE run = ? AND box = ? AND action IS NULL AND dest IS NOT NULL AND dest <> ''
+		UNION SELECT sug_folder FROM msgs WHERE run = ? AND box = ? AND sug_kind = 'new' AND sug_folder IS NOT NULL");
+	$q->execute(array($run_id, $email, $run_id, $email));
+	$out = array();
+	foreach($q->fetchAll(PDO::FETCH_COLUMN) as $f){
+		if(is_string($f) && mc_valid_folder($f) && !in_array($f, $t['all'], true) && ($t['prefix'] === '' || strpos($f, $t['prefix']) === 0)) $out[] = $f;
+	}
+	sort($out);
+	return $cache[$run_id] = $out;
+}
+
+// Filters on the review page: tab + search + current choice + AI suggestion.
+// Returns array(sql, params) for "WHERE run = ? AND box = ? AND ..." (run/box included).
+function mc_filter($run_id, $email, $tab, $f){
+	$sql = 'run = ? AND box = ? AND '.mc_tab_where($tab);
+	$par = array($run_id, $email);
+	if($f['q'] !== ''){
+		$sql .= " AND (subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')";
+		$like = '%'.addcslashes($f['q'], '%_\\').'%';
+		$par[] = $like; $par[] = $like;
+	}
+	if($f['fc'] === '__spam') $sql .= ' AND pick = 1';
+	elseif($f['fc'] === '__leave') $sql .= " AND pick = 0 AND (dest IS NULL OR dest = '')";
+	elseif($f['fc'] === '__file') $sql .= " AND pick = 0 AND dest IS NOT NULL AND dest <> ''";
+	elseif($f['fc'] !== ''){ $sql .= ' AND pick = 0 AND dest = ?'; $par[] = $f['fc']; }
+	if($f['fs'] === '__none') $sql .= ' AND sug_kind IS NULL';
+	elseif($f['fs'] === '__leave') $sql .= " AND sug_kind = 'leave'";
+	elseif($f['fs'] !== ''){ $sql .= ' AND sug_folder = ?'; $par[] = $f['fs']; }
+	return array($sql, $par);
+}
+
+// Read the filter values from GET or POST.
+function mc_filter_in($src){
+	$g = function($k) use ($src){ return isset($src[$k]) && is_string($src[$k]) ? $src[$k] : ''; };
+	$q = trim(mc_one_line($g('q'), 120));
+	$fc = $g('fc'); $fs = $g('fs');
+	if($fc !== '' && !in_array($fc, array('__spam', '__leave', '__file'), true) && !mc_valid_folder($fc)) $fc = '';
+	if($fs !== '' && !in_array($fs, array('__none', '__leave'), true) && !mc_valid_folder($fs)) $fs = '';
+	return array('q' => $q, 'fc' => $fc, 'fs' => $fs);
+}
+
+function mc_filter_qs($f){
+	$o = '';
+	foreach(array('q', 'fc', 'fs') as $k) if($f[$k] !== '') $o .= '&'.$k.'='.rawurlencode($f[$k]);
+	return $o;
 }
 
 // What "Apply" would do right now.
@@ -546,6 +688,7 @@ if($act === 'box'){
 	mc_head($email);
 	if(mc_get('saved') === '1') mc_note('Settings saved.', 'ok');
 	if(mc_get('closed') === '1') mc_note('Check closed. Nothing was moved, and those messages will not be offered again.', 'ok');
+	if(mc_get('cancelled') === '1') mc_note('Cancelled before it started. Nothing was checked.', 'ok');
 	if(mc_is_paused()) mc_note('<i class="fas fa-pause-circle me-1"></i>The server administrator has paused AI Mail Cleaner. Jobs will wait until it is resumed.', 'warn');
 
 	$folders_all = mc_dove_folders($email);
@@ -559,7 +702,18 @@ if($act === 'box'){
 			$pct = !empty($p['total']) ? (int)floor(100 * (int)$p['done'] / max(1, (int)$p['total'])) : 0;
 			echo '<div id="mcprog"><div class="d-flex justify-content-between" style="font-size:14px;font-weight:500"><span id="mcphase">'
 				.h(mc_queued($email) ? 'Waiting for the server to start (up to a minute)…' : 'Working…').'</span><span id="mccount" class="mc-faint"></span></div>'
-				.'<div class="mc-bar"><span id="mcbar" style="width:'.$pct.'%"></span></div>'
+				.'<div class="mc-bar"><span id="mcbar" style="width:'.$pct.'%"></span></div>';
+			$stoppable = in_array($st['kind'] ?? '', array('scan', 'recheck', 'sort'), true);
+			if($stoppable){
+				$asked = mc_stop_requested($email) || mc_get('stopping') === '1';
+				echo '<form method="post" action="?act=stop" class="mc-stoprow" id="mcstopf">';
+				mc_tok_field();
+				echo '<input type="hidden" name="box" value="'.h($email).'">'
+					.'<button class="flat-butt-primary btn-sm" type="submit" id="mcstop"'.($asked ? ' disabled' : '').'><i class="fas fa-stop-circle me-1"></i>'
+					.($asked ? 'Stopping after this batch…' : (mc_queued($email) ? 'Cancel' : 'Stop and review what is done')).'</button>'
+					.'<span class="hint">'.(($st['kind'] ?? '') === 'scan' ? 'Everything checked so far is kept. The rest waits for the next check.' : 'Everything finished so far is kept.').'</span></form>';
+			}
+			echo ''
 				.'<details class="mc-logwrap"><summary class="mc-faint">Show details</summary><pre id="mclog" style="max-height:260px;margin-top:8px">…</pre></details></div>';
 		}else{
 			if(($st['state'] ?? '') === 'failed') mc_note('<b>The last job failed:</b> '.h($st['error'] ?? 'unknown error'), 'err');
@@ -576,8 +730,11 @@ if($act === 'box'){
 			echo '<div class="mc-checkrow"><form method="post" action="?act=scan">';
 			mc_tok_field();
 			echo '<input type="hidden" name="box" value="'.h($email).'">'
-				.'<button class="'.($wait !== '' ? 'flat-butt-primary' : 'flat-butt').'" type="submit"><i class="fas fa-search me-1"></i>Check now</button></form>'
-				.'<div class="hint mt-0">Looks at new mail in '.h(implode(', ', array_map($disp, $box['folders']))).'. You decide before anything moves.</div></div>';
+				.'<button class="'.($wait !== '' ? 'flat-butt-primary' : 'flat-butt').'" type="submit"><i class="fas fa-search me-1"></i>Check now</button>'
+				.'<label class="mc-lim">the newest <input class="form-control" type="number" name="limit" id="mclimit" min="1" max="50000" step="1" value="500" list="mclims" placeholder="all"> messages</label>'
+				.'<datalist id="mclims"><option value="50"><option value="100"><option value="250"><option value="500"><option value="1000"><option value="2000"></datalist>'
+				.'</form>'
+				.'<div class="hint mt-0"><span id="mcunchk">Counting messages not checked yet…</span> Folders: '.h(implode(', ', array_map($disp, $box['folders']))).'. Leave the number empty to check them all. You can stop a check at any time and review what is done.</div></div>';
 		}
 
 		$runs = mc_db_runs($email, 8);
@@ -687,6 +844,19 @@ var r=document.querySelectorAll(".mc-auto"),a=document.getElementById("ackmove")
 function t(){var on=false;for(var i=0;i<r.length;i++)if(r[i].checked&&r[i].value==="move")on=true;if(a)a.style.display=on?"block":"none";}
 for(var i=0;i<r.length;i++)r[i].addEventListener("change",t);t();
 })();</script>';
+	if($box && !$busy){
+		// "N not checked yet", and what the newest-N box will do with it
+		$js .= '<script>(function(){
+var el=document.getElementById("mcunchk"),lim=document.getElementById("mclimit");if(!el)return;var n=null,all=0;
+function fmt(x){return Number(x).toLocaleString();}
+function show(){if(n===null)return;if(n===0){el.innerHTML="<b>Nothing new</b> to check ("+fmt(all)+" messages, all checked before).";return;}
+ var v=parseInt(lim&&lim.value,10),k=(v>0&&v<n)?v:n;
+ el.innerHTML="<b>"+fmt(n)+"</b> not checked yet (of "+fmt(all)+"). This check will look at <b>"+(k<n?"the newest "+fmt(k):"all "+fmt(n))+"</b>"+(k<n?"; the rest wait for the next check.":".");}
+fetch("?act=count&box='.rawurlencode($email).'",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
+ if(!d.ok){el.textContent="";return;}n=d.unchecked;all=d.total;show();}).catch(function(){el.textContent="";});
+if(lim)lim.addEventListener("input",show);
+})();</script>';
+	}
 	if($busy){
 		$js .= '<script>(function(){
 var url="?act=poll&box='.rawurlencode($email).'",log=document.getElementById("mclog"),bar=document.getElementById("mcbar"),
@@ -717,6 +887,8 @@ if($act === 'run'){
 	$T = mc_targets_for($email, $box);
 	$rf = $t['review_folder'] ?? $box['review_folder'];
 	$rf_short = mc_folder_display($rf, $T['prefix']);
+	$pend = mc_pending_new($email, $box, $run_id);
+	$fd = function($f) use ($T){ return mc_folder_display($f, $T['prefix']); };
 
 	$counts = array();
 	foreach(array('move', 'review', 'keep', 'done') as $k){
@@ -735,32 +907,76 @@ if($act === 'run'){
 
 	$tab = mc_get('tab');
 	if(mc_tab_where($tab) === null) $tab = $counts['move'] ? 'move' : ($counts['review'] ? 'review' : ($counts['keep'] ? 'keep' : 'done'));
-	$page = max(1, (int)mc_get('p'));
-	$per = 100;
-	$q = $db->prepare('SELECT * FROM msgs WHERE run = ? AND box = ? AND '.mc_tab_where($tab).' ORDER BY uid DESC LIMIT '.$per.' OFFSET '.(($page - 1) * $per));
-	$q->execute(array($run_id, $email));
+	$f = mc_filter_in($_GET);
+	$filtered = ($f['q'] !== '' || $f['fc'] !== '' || $f['fs'] !== '');
+	list($where, $par) = mc_filter($run_id, $email, $tab, $f);
+	$c = $db->prepare('SELECT COUNT(*) FROM msgs WHERE '.$where);
+	$c->execute($par);
+	$nmatch = (int)$c->fetchColumn();
+	$per = (int)mc_get('pp');
+	if(!in_array($per, array(100, 250, 500), true)) $per = 100;
+	$pages = max(1, (int)ceil($nmatch / $per));
+	$page = min($pages, max(1, (int)mc_get('p')));
+	$q = $db->prepare('SELECT * FROM msgs WHERE '.$where.' ORDER BY uid DESC LIMIT '.$per.' OFFSET '.(($page - 1) * $per));
+	$q->execute($par);
 	$rows = $q->fetchAll();
-	$base = '?act=run&amp;box='.h(rawurlencode($email)).'&amp;run='.h(rawurlencode($run_id));
-	$hidden = '<input type="hidden" name="box" value="'.h($email).'"><input type="hidden" name="run" value="'.h($run_id).'">';
 
-	// <option>s for a message's choice
-	$folder_opts = function($sel, $sug_new) use ($T){
+	// facet counts for the filter dropdowns (within the tab)
+	$fc_counts = array(); $fs_counts = array();
+	if($tab !== 'done'){
+		$g = $db->prepare("SELECT CASE WHEN pick = 1 THEN '__spam' WHEN dest IS NULL OR dest = '' THEN '__leave' ELSE dest END AS k, COUNT(*) AS n
+			FROM msgs WHERE run = ? AND box = ? AND ".mc_tab_where($tab).' GROUP BY k ORDER BY n DESC');
+		$g->execute(array($run_id, $email));
+		foreach($g->fetchAll() as $r) $fc_counts[$r['k']] = (int)$r['n'];
+	}
+	$g = $db->prepare("SELECT CASE WHEN sug_kind IS NULL THEN '__none' WHEN sug_kind = 'leave' THEN '__leave' ELSE sug_folder END AS k, COUNT(*) AS n
+		FROM msgs WHERE run = ? AND box = ? AND ".mc_tab_where($tab).' GROUP BY k ORDER BY n DESC');
+	$g->execute(array($run_id, $email));
+	foreach($g->fetchAll() as $r) $fs_counts[$r['k']] = (int)$r['n'];
+
+	$base = '?act=run&amp;box='.h(rawurlencode($email)).'&amp;run='.h(rawurlencode($run_id));
+	$here = $base.'&amp;tab='.h($tab).h(mc_filter_qs($f)).($per !== 100 ? '&amp;pp='.$per : '');
+	$hidden = '<input type="hidden" name="box" value="'.h($email).'"><input type="hidden" name="run" value="'.h($run_id).'">';
+	$fhidden = '<input type="hidden" name="tab" value="'.h($tab).'"><input type="hidden" name="q" value="'.h($f['q']).'"><input type="hidden" name="fc" value="'.h($f['fc']).'"><input type="hidden" name="fs" value="'.h($f['fs']).'">';
+
+	// <option>s: pending new folders first, then the mailbox's folders
+	$folder_opts = function($sel) use ($T, $pend, $fd){
 		$o = '';
-		if($sug_new !== '') $o .= '<option value="'.h($sug_new).'"'.($sel === $sug_new ? ' selected' : '').'>New folder: '.h(mc_folder_display($sug_new, $T['prefix'])).'</option>';
+		foreach($pend as $full) $o .= '<option value="'.h($full).'"'.($sel === $full ? ' selected' : '').'>New folder: '.h($fd($full)).'</option>';
 		foreach($T['targets'] as $disp => $full) $o .= '<option value="'.h($full).'"'.($sel === $full ? ' selected' : '').'>'.h($disp).'</option>';
 		return $o;
+	};
+	$label_of = function($k) use ($fd, $T, $pend){
+		if($k === '__spam') return 'Spam folder';
+		if($k === '__leave') return 'Leave where it is';
+		if($k === '__none') return 'Not asked';
+		return (in_array($k, $T['all'], true) ? '' : 'New: ').$fd($k);
+	};
+
+	// quick-action data: the Archive folder, and folders already used in this check ("recent")
+	$arch = mc_archive_folder($email, $box);
+	$rq = $db->prepare("SELECT dest, COUNT(*) AS n FROM msgs WHERE run = ? AND box = ? AND pick = 0 AND dest IS NOT NULL AND dest <> '' AND dest <> ? GROUP BY dest ORDER BY n DESC LIMIT 3");
+	$rq->execute(array($run_id, $email, $arch));
+	$recent = array();
+	foreach($rq->fetchAll() as $r) $recent[$r['dest']] = $fd($r['dest']);
+	$dl_names = array_keys($T['targets']);
+	foreach($pend as $pf) $dl_names[] = $fd($pf);
+	$qa = function($v, $m, $label, $cur, $cls = '', $title = '') {
+		return '<button type="button" class="mc-qa '.$cls.($cur === $m ? ' on' : '').'" data-v="'.h($v).'" data-m="'.h($m).'"'.($title !== '' ? ' title="'.h($title).'"' : '').'>'.$label.'</button>';
 	};
 
 	mc_head($email);
 	mc_card('<i class="fas fa-clipboard-check me-2"></i>Review: '.h($email).($run['trig'] === 'auto' ? ' <span class="mc-tag">automatic</span>' : ''),
-		'Checked '.(int)($t['looked'] ?? 0).' messages in '.h(implode(', ', array_map(function($f) use ($T){ return mc_folder_display($f, $T['prefix']); }, $t['folders'] ?? $box['folders'])))
+		'Checked '.(int)($t['looked'] ?? 0).' messages in '.h(implode(', ', array_map($fd, $t['folders'] ?? $box['folders'])))
 		.' &middot; '.mc_rel($run['started']));
 
-	if($run['state'] === 'review' && $open) echo '<div class="mc-lead">Nothing has moved yet. Pick what happens to each message, then press <b>Apply</b>.</div>';
+	if(mc_get('set') !== '') mc_note('Updated '.(int)mc_get('set').' message(s). Nothing has moved yet; press <b>Apply</b> when you are done.', 'ok');
+	elseif($run['state'] === 'review' && $open) echo '<div class="mc-lead">Nothing has moved yet. Pick what happens to each message (tick several to change them at once), then press <b>Apply</b>.</div>';
 	elseif(!empty($t['dismissed']) && $open) echo '<div class="mc-lead">You closed this check without changes. You can still pick messages and apply.</div>';
-	if(!empty($t['left_for_next'])) mc_note((int)$t['left_for_next'].' older messages were not checked yet (limit per check). Press "Check now" again afterwards to continue.', 'info');
+	if(!empty($t['left_for_next'])) mc_note((!empty($t['stopped']) ? 'This check was stopped early. ' : '')
+		.number_format((int)$t['left_for_next']).' older messages were not checked yet. They are untouched; press "Check now" later to continue with them.', 'info');
 
-	// ---- tabs (they are also the summary)
+	// ---- tabs
 	$tabs = array('move' => array('Spam', 'fa-ban'), 'review' => array('Unsure', 'fa-question-circle'), 'keep' => array('Looks fine', 'fa-check'), 'done' => array('Done', 'fa-history'));
 	echo '<div class="mc-tabs">';
 	foreach($tabs as $k => $l){
@@ -770,29 +986,68 @@ if($act === 'run'){
 
 	$can_choose = $tab !== 'done' && !$busy;
 
-	// ---- toolbar: bulk choice + AI tools
-	if($can_choose && $counts[$tab] > 0){
-		echo '<div class="mc-toolbar"><form method="post" action="?act=setall" class="mc-bulk">';
+	// ---- filter bar (GET)
+	if($counts[$tab] > 0){
+		echo '<form method="get" class="mc-filters"><input type="hidden" name="act" value="run"><input type="hidden" name="box" value="'.h($email).'">'
+			.'<input type="hidden" name="run" value="'.h($run_id).'"><input type="hidden" name="tab" value="'.h($tab).'">'
+			.'<div class="mc-search"><i class="fas fa-search"></i><input class="form-control form-control-sm" type="search" name="q" value="'.h($f['q']).'" placeholder="Sender or subject"></div>';
+		if($tab !== 'done'){
+			echo '<select class="form-select form-control form-select-sm" name="fc" title="What each message is set to"><option value="">Set to: anything</option>';
+			foreach($fc_counts as $k => $n) echo '<option value="'.h($k).'"'.($f['fc'] === $k ? ' selected' : '').'>Set to: '.h($label_of($k)).' ('.$n.')</option>';
+			if($f['fc'] !== '' && !isset($fc_counts[$f['fc']])) echo '<option value="'.h($f['fc']).'" selected>Set to: '.h($label_of($f['fc'])).' (0)</option>';
+			echo '</select>';
+		}
+		if(count($fs_counts) > 1 || !isset($fs_counts['__none'])){
+			echo '<select class="form-select form-control form-select-sm" name="fs" title="What the AI suggested"><option value="">AI suggested: anything</option>';
+			foreach($fs_counts as $k => $n) echo '<option value="'.h($k).'"'.($f['fs'] === $k ? ' selected' : '').'>AI suggested: '.h($label_of($k)).' ('.$n.')</option>';
+			echo '</select>';
+		}
+		echo '<select class="form-select form-control form-select-sm" name="pp" title="Messages per page">';
+		foreach(array(100, 250, 500) as $n) echo '<option value="'.$n.'"'.($per === $n ? ' selected' : '').'>'.$n.' per page</option>';
+		echo '</select><button class="flat-butt-primary btn-sm" type="submit">Filter</button>'
+			.($filtered ? '<a class="mc-clear" href="'.$base.'&amp;tab='.h($tab).'">Clear</a>' : '').'</form>';
+	}
+
+	// ---- selection bar (POST)
+	if($rows && ($can_choose || ($tab === 'done' && !$busy && $undoable))){
+		echo '<form method="post" action="?act='.($tab === 'done' ? 'putback' : 'bulk').'" class="mc-selbar" id="mcsel">';
 		mc_tok_field();
-		echo $hidden.'<input type="hidden" name="tab" value="'.h($tab).'"><label for="bulkv">Set all '.$counts[$tab].' to</label>'
-			.'<select class="form-select form-control form-select-sm" id="bulkv" name="v"><option value="__spam">Spam folder</option><option value="__leave">Leave where it is</option>'
-			.($nsug ? '<option value="__ai">The AI\'s folder suggestion</option>' : '')
-			.'<optgroup label="Move to folder">'.$folder_opts('', '').'</optgroup></select>'
-			.'<button class="flat-butt-primary btn-sm" type="submit">Set</button></form></div>';
+		echo $hidden.$fhidden.'<input type="hidden" name="ids" id="mcids" value=""><input type="hidden" name="scope" id="mcscope" value="ids">'
+			.'<label class="mc-selall"><input class="form-check-input" type="checkbox" id="mcall"> <span id="mcselt">Select all on this page</span></label>'
+			.($nmatch > count($rows) ? '<a href="#" id="mcallmatch" class="mc-allmatch" style="display:none">Select all '.number_format($nmatch).' matching</a>' : '')
+			.'<span class="mc-selact" id="mcselact">';
+		if($tab === 'done'){
+			echo '<button class="flat-butt-primary btn-sm" type="submit" onclick="return confirm(\'Put the selected messages back where they came from?\')"><i class="fas fa-undo me-1"></i>Put back selected</button>';
+		}else{
+			echo '<span class="mc-selact-l">Selected:</span>'
+				.'<button class="mc-qa mc-qa-spam" type="submit" name="v" value="__spam"><i class="fas fa-ban"></i>Spam</button>'
+				.'<button class="mc-qa mc-qa-keep" type="submit" name="v" value="__leave"><i class="fas fa-inbox"></i>Keep</button>'
+				.'<button class="mc-qa mc-qa-arch" type="submit" name="v" value="__archive"><i class="fas fa-archive"></i>Archive</button>'
+				.($nsug ? '<button class="mc-qa mc-qa-ai" type="submit" name="v" value="__ai" title="Each message goes where the AI suggested"><i class="fas fa-magic"></i>AI\'s pick</button>' : '')
+				.'<span class="mc-fbox"><i class="fas fa-folder"></i><input class="form-control form-control-sm" type="text" name="newname" id="mcnew" list="mcfolders" maxlength="80" placeholder="Folder name, new or existing" autocomplete="off"></span>'
+				.'<button class="flat-butt btn-sm" type="submit" name="v" value="__new" id="mcbmove">Move</button>';
+		}
+		echo '</span></form>';
 	}
 
 	// ---- messages
 	if(!$rows){
-		echo '<div class="mc-empty"><i class="fas fa-inbox fa-2x mb-2"></i><div class="mc-empty-t">Nothing here</div></div>';
+		echo '<div class="mc-empty"><i class="fas fa-inbox fa-2x mb-2"></i><div class="mc-empty-t">'.($filtered ? 'No messages match these filters' : 'Nothing here').'</div></div>';
 	}else{
+		if($filtered) echo '<div class="hint mt-0 mb-2">'.number_format($nmatch).' message(s) match.</div>';
+		$selectable = $can_choose || ($tab === 'done' && !$busy);
 		echo '<div class="mc-msgs">';
 		foreach($rows as $m){
-			$v = null;
-			if($m['v1_verdict'] !== null && $m['v1_verdict'] !== 'error') $v = array($m['v1_verdict'], $m['v1_conf'], $m['v1_reason'], $m['v1_model']);
-			$v2 = ($m['v2_verdict'] !== null && $m['v2_verdict'] !== 'error') ? array($m['v2_verdict'], $m['v2_conf'], $m['v2_reason'], $m['v2_model']) : null;
-			echo '<div class="mc-msg"><div class="mc-msg-main">'
+			$v = ($m['v1_verdict'] !== null && $m['v1_verdict'] !== 'error') ? array($m['v1_verdict'], $m['v1_conf'], $m['v1_reason']) : null;
+			$v2 = ($m['v2_verdict'] !== null && $m['v2_verdict'] !== 'error') ? array($m['v2_verdict'], $m['v2_conf'], $m['v2_reason']) : null;
+			$addr = mc_addr($m['sender']);
+			$can_sel = $selectable && ($tab !== 'done' || in_array($m['action'], array('moved', 'filed'), true));
+			echo '<div class="mc-msg">'
+				.($selectable ? '<div class="mc-msg-sel">'.($can_sel ? '<input class="form-check-input mc-sel" type="checkbox" value="'.(int)$m['id'].'" aria-label="Select this message">' : '').'</div>' : '')
+				.'<div class="mc-msg-main">'
 				.'<div class="mc-msg-subj">'.h($m['subject'] !== '' ? $m['subject'] : '(no subject)').'</div>'
-				.'<div class="mc-msg-from">'.h($m['sender']).' <span class="mc-dot">&middot;</span> '.h(mc_short_date($m['mdate'])).'</div>'
+				.'<div class="mc-msg-from">'.($addr !== '' ? '<a href="'.$base.'&amp;tab='.h($tab).'&amp;q='.h(rawurlencode($addr)).'" title="Show only mail from this sender">'.h($m['sender']).'</a>' : h($m['sender']))
+				.' <span class="mc-dot">&middot;</span> '.h(mc_short_date($m['mdate'])).'</div>'
 				.'<div class="mc-msg-why">';
 			if($v) echo mc_verdict_tag($v[0], $v[1]).' '.h($v[2] !== '' ? $v[2] : mc_why($m['why']));
 			else echo '<span class="mc-faint">'.h(mc_why($m['why'])).'</span>';
@@ -800,38 +1055,52 @@ if($act === 'run'){
 			if($m['sa'] !== null) echo ' <span class="mc-sa" title="SpamAssassin score">SA '.h(number_format((float)$m['sa'], 1)).'</span>';
 			echo '</div>';
 			if($m['sug_kind'] !== null && $m['action'] === null){
-				$sd = $m['sug_folder'] ? mc_folder_display($m['sug_folder'], $T['prefix']) : '';
 				echo '<div class="mc-msg-sug"><i class="fas fa-folder-open me-1"></i>'
-					.($m['sug_kind'] === 'leave' ? 'AI: best left where it is' : 'AI suggests '.($m['sug_kind'] === 'new' ? 'a new folder ' : '').'<b>'.h($sd).'</b>')
+					.($m['sug_kind'] === 'leave' ? 'AI: best left where it is' : 'AI suggests '.($m['sug_kind'] === 'new' ? 'a new folder ' : '').'<b>'.h($fd((string)$m['sug_folder'])).'</b>')
 					.($m['sug_reason'] ? ' <span class="mc-faint">— '.h($m['sug_reason']).'</span>' : '').'</div>';
 			}
 			echo '</div><div class="mc-msg-act">';
 			if($m['action'] === null){
-				$sel = (int)$m['pick'] === 1 ? '__spam' : (($m['dest'] ?? '') !== '' ? $m['dest'] : '__leave');
-				$sug_new = ($m['sug_kind'] === 'new' && $m['sug_folder']) ? $m['sug_folder'] : '';
-				echo '<select class="form-select form-control form-select-sm mc-choice mc-c-'.($sel === '__spam' ? 'spam' : ($sel === '__leave' ? 'leave' : 'file')).'" data-id="'.(int)$m['id'].'"'.($can_choose ? '' : ' disabled').' aria-label="What to do with this message">'
-					.'<option value="__spam"'.($sel === '__spam' ? ' selected' : '').'>Spam folder</option>'
-					.'<option value="__leave"'.($sel === '__leave' ? ' selected' : '').'>Leave where it is</option>'
-					.'<optgroup label="Move to folder">'.$folder_opts($sel, $sug_new).'</optgroup></select>';
+				$cur = (int)$m['pick'] === 1 ? '__spam' : (($m['dest'] ?? '') !== '' ? $m['dest'] : '__leave');
+				$sug = ($m['sug_kind'] === 'existing' || $m['sug_kind'] === 'new') && $m['sug_folder'] && $m['sug_folder'] !== $arch ? $m['sug_folder'] : '';
+				$chips = array($arch => 1);
+				if($sug !== '') $chips[$sug] = 1;
+				echo '<div class="mc-qas'.($can_choose ? '' : ' off').'" data-id="'.(int)$m['id'].'" data-cur="'.h($cur).'">'
+					.$qa('__spam', '__spam', '<i class="fas fa-ban"></i>Spam', $cur, 'mc-qa-spam', 'Move to '.$rf_short)
+					.$qa('__leave', '__leave', '<i class="fas fa-inbox"></i>Keep', $cur, 'mc-qa-keep', 'Leave it where it is')
+					.$qa('__archive', $arch, '<i class="fas fa-archive"></i>Archive', $cur, 'mc-qa-arch', 'Move to '.$fd($arch).(in_array($arch, $T['all'], true) ? '' : ' (created when you apply)'))
+					.($sug !== '' ? $qa($sug, $sug, '<i class="fas fa-magic"></i>'.h($fd($sug)), $cur, 'mc-qa-ai', 'The AI suggests this folder'.($m['sug_kind'] === 'new' ? ' (new)' : '')) : '');
+				foreach($recent as $rfull => $rlabel){
+					if(isset($chips[$rfull])) continue;
+					echo $qa($rfull, $rfull, '<i class="fas fa-redo-alt"></i>'.h($rlabel), $cur, 'mc-qa-rec', 'Used for other messages in this check');
+					$chips[$rfull] = 1;
+				}
+				$custom = ($cur !== '__spam' && $cur !== '__leave' && !isset($chips[$cur])) ? $fd($cur) : '';
+				echo '<span class="mc-fbox"><i class="fas fa-folder"></i><input class="form-control form-control-sm mc-fin'.($custom !== '' ? ' on' : '').'" type="text" list="mcfolders" maxlength="80" value="'.h($custom).'" placeholder="Other folder…" autocomplete="off" aria-label="Type a folder name"></span>'
+					.'</div>';
 			}else{
-				$st = array('moved' => 'In '.$rf_short, 'filed' => 'Filed in '.mc_folder_display((string)$m['filed_to'], $T['prefix']), 'restored' => 'Back in '.mc_folder_display($m['folder'], $T['prefix']),
+				$st = array('moved' => 'In '.$rf_short, 'filed' => 'Filed in '.$fd((string)$m['filed_to']), 'restored' => 'Back in '.$fd($m['folder']),
 					'error' => 'Problem', 'gone' => 'No longer in the mailbox');
 				echo '<div class="mc-done-st mc-done-'.h($m['action']).'">'.h($st[$m['action']] ?? $m['action']).'</div>';
 				if($m['err']) echo '<div class="mc-faint" style="font-size:12px">'.h($m['err']).'</div>';
 				if(in_array($m['action'], array('moved', 'filed'), true)){
 					echo '<form method="post" action="?act=restore" class="mt-1">';
 					mc_tok_field();
-					echo $hidden.'<input type="hidden" name="msg" value="'.(int)$m['id'].'"><button class="flat-butt-primary btn-sm" type="submit"'.($busy ? ' disabled' : '').' title="Move it back to '.h(mc_folder_display($m['folder'], $T['prefix'])).'">'
+					echo $hidden.'<input type="hidden" name="msg" value="'.(int)$m['id'].'"><button class="flat-butt-primary btn-sm" type="submit"'.($busy ? ' disabled' : '').' title="Move it back to '.h($fd($m['folder'])).'">'
 						.'<i class="fas fa-undo me-1"></i>Put back</button></form>';
 				}
 			}
 			echo '</div></div>';
 		}
-		echo '</div>';
-		$pages = (int)ceil($counts[$tab] / $per);
+		echo '</div><datalist id="mcfolders">';
+		foreach(array_unique($dl_names) as $n) echo '<option value="'.h($n).'">';
+		echo '</datalist>';
 		if($pages > 1){
 			echo '<div class="mc-pager">Page';
-			for($i = 1; $i <= $pages; $i++) echo $i === $page ? ' <b>'.$i.'</b>' : ' <a href="'.$base.'&amp;tab='.h($tab).'&amp;p='.$i.'">'.$i.'</a>';
+			for($i = 1; $i <= $pages; $i++){
+				if($pages > 12 && $i > 2 && $i < $pages - 1 && abs($i - $page) > 2){ if($i === 3 || $i === $pages - 2) echo ' …'; continue; }
+				echo $i === $page ? ' <b>'.$i.'</b>' : ' <a href="'.$here.'&amp;p='.$i.'">'.$i.'</a>';
+			}
 			echo '</div>';
 		}
 	}
@@ -892,19 +1161,76 @@ if($act === 'run'){
 	mc_card_end();
 
 	$js = '<script>(function(){
-var tok='.json_encode($TOK).',box='.json_encode($email).',run='.json_encode($run_id).',rf='.json_encode($rf_short).';
+var tok='.json_encode($TOK).',box='.json_encode($email).',run='.json_encode($run_id).',rf='.json_encode($rf_short).',nmatch='.(int)$nmatch.';
 function plan(d){var p=[];if(d.spam)p.push(d.spam+" to "+rf);if(d.file)p.push(d.file+" into "+d.folders+" folder"+(d.folders===1?"":"s"));
  return p.length?"Apply will move "+p.join(" and ")+". Everything else stays where it is.":"Nothing is set to move yet.";}
-document.addEventListener("change",function(e){var c=e.target;if(!c.classList||!c.classList.contains("mc-choice"))return;
- var fd=new FormData();fd.append("tok",tok);fd.append("box",box);fd.append("run",run);fd.append("id",c.getAttribute("data-id"));fd.append("v",c.value);
- c.disabled=true;
- fetch("?act=choose",{method:"POST",body:fd,credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
-  c.disabled=false;if(!d.ok){alert(d.error||"Could not save that. Reload the page.");location.reload();return;}
-  c.className=c.className.replace(/mc-c-\w+/,"mc-c-"+(c.value==="__spam"?"spam":(c.value==="__leave"?"leave":"file")));
-  var p=document.getElementById("mcplan");if(p)p.textContent=plan(d);
-  var b=document.getElementById("mcapplyb");if(b)b.disabled=!(d.spam+d.file);
- }).catch(function(){c.disabled=false;alert("Could not save that. Reload the page.");});
-});})();</script>';
+function setPlan(d){var p=document.getElementById("mcplan");if(p)p.textContent=plan(d);var b=document.getElementById("mcapplyb");if(b)b.disabled=!(d.spam+d.file);}
+/* row quick actions: Spam / Keep / Archive / AI pick / recent folders / type a folder */
+function mark(g,cur,label){g.setAttribute("data-cur",cur);var hit=false;
+ g.querySelectorAll(".mc-qa").forEach(function(b){var on=b.getAttribute("data-m")===cur;b.classList.toggle("on",on);if(on)hit=true;});
+ var i=g.querySelector(".mc-fin");if(i){var custom=(cur!=="__spam"&&cur!=="__leave"&&!hit);i.classList.toggle("on",custom);if(document.activeElement!==i||!custom)i.value=custom?label:"";i.setAttribute("data-last",i.value);}
+ var row=g.closest(".mc-msg");if(row){row.classList.toggle("to-spam",cur==="__spam");row.classList.toggle("to-folder",cur!=="__spam"&&cur!=="__leave");}}
+function addRecent(val,label){if(!val||val==="__spam"||val==="__leave")return;
+ var dl=document.getElementById("mcfolders");
+ if(dl&&!Array.prototype.some.call(dl.options,function(o){return o.value===label;})){var o=document.createElement("option");o.value=label;dl.appendChild(o);}
+ document.querySelectorAll(".mc-qas").forEach(function(g){
+  if(g.querySelector(".mc-qa[data-m=\""+CSS.escape(val)+"\"]"))return;
+  var b=document.createElement("button");b.type="button";b.className="mc-qa mc-qa-rec";b.setAttribute("data-v",val);b.setAttribute("data-m",val);
+  b.title="Used for other messages in this check";b.innerHTML="<i class=\"fas fa-redo-alt\"></i>";b.appendChild(document.createTextNode(label));
+  g.insertBefore(b,g.querySelector(".mc-fbox"));
+  var recs=g.querySelectorAll(".mc-qa-rec:not(.on)");if(g.querySelectorAll(".mc-qa-rec").length>3&&recs.length)g.removeChild(recs[0]);});}
+function choose(g,v,name){if(!g||g.classList.contains("off"))return;
+ var fd=new FormData();fd.append("tok",tok);fd.append("box",box);fd.append("run",run);fd.append("id",g.getAttribute("data-id"));fd.append("v",v);if(name!==undefined)fd.append("name",name);
+ g.classList.add("busy");
+ fetch("?act=choose",{method:"POST",body:fd,credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){g.classList.remove("busy");
+  if(!d.ok){alert(d.error||"Could not save that.");var i=g.querySelector(".mc-fin");if(i)i.value=i.getAttribute("data-last")||"";return;}
+  if(v==="__new")addRecent(d.value,d.label);
+  mark(g,d.value,d.label);setPlan(d);
+ }).catch(function(){g.classList.remove("busy");alert("Could not save that. Reload the page.");});}
+document.addEventListener("click",function(e){var b=e.target.closest?e.target.closest(".mc-qas .mc-qa"):null;if(!b)return;e.preventDefault();
+ var g=b.closest(".mc-qas");if(g.getAttribute("data-cur")===b.getAttribute("data-m"))return;choose(g,b.getAttribute("data-v"));});
+function commit(i){var v=i.value.trim();if(v===""||v===i.getAttribute("data-last"))return;i.setAttribute("data-last",v);choose(i.closest(".mc-qas"),"__new",v);}
+document.addEventListener("keydown",function(e){var i=e.target;if(!i.classList||!i.classList.contains("mc-fin"))return;
+ if(e.key==="Enter"){e.preventDefault();commit(i);}else if(e.key==="Escape"){i.value=i.getAttribute("data-last")||"";i.blur();}});
+document.addEventListener("change",function(e){var i=e.target;if(i.classList&&i.classList.contains("mc-fin"))commit(i);});
+document.addEventListener("input",function(e){var i=e.target;if(i.classList&&i.classList.contains("mc-fin")&&e.inputType==="insertReplacementText")commit(i);});
+document.querySelectorAll(".mc-qas").forEach(function(g){var i=g.querySelector(".mc-fin");mark(g,g.getAttribute("data-cur"),i?i.value:"");});
+/* selection */
+var form=document.getElementById("mcsel");if(!form)return;
+var all=document.getElementById("mcall"),txt=document.getElementById("mcselt"),am=document.getElementById("mcallmatch"),
+ ids=document.getElementById("mcids"),scope=document.getElementById("mcscope"),act=document.getElementById("mcselact"),
+ nw=document.getElementById("mcnew"),last=null,subv=null;
+function boxes(){return Array.prototype.slice.call(document.querySelectorAll(".mc-sel"));}
+function upd(){var b=boxes(),n=0;b.forEach(function(x){if(x.checked)n++;});
+ if(scope.value==="all"){txt.textContent="All "+nmatch.toLocaleString()+" matching messages selected";if(am){am.textContent="Clear selection";am.style.display="";}}
+ else{txt.textContent=n?n+" selected":"Select all on this page";if(am){am.textContent="Select all "+nmatch.toLocaleString()+" matching";am.style.display=(n===b.length&&n>0)?"":"none";}}
+ all.checked=n>0&&n===b.length;all.indeterminate=n>0&&n<b.length;
+ act.classList.toggle("on",n>0||scope.value==="all");
+ document.querySelectorAll(".mc-msg").forEach(function(r){var x=r.querySelector(".mc-sel");r.classList.toggle("sel",!!(x&&x.checked));});}
+all.addEventListener("change",function(){boxes().forEach(function(x){x.checked=all.checked;});scope.value="ids";upd();});
+if(am)am.addEventListener("click",function(e){e.preventDefault();if(scope.value==="all"){scope.value="ids";boxes().forEach(function(x){x.checked=false;});}else{scope.value="all";boxes().forEach(function(x){x.checked=true;});}upd();});
+function pick(x,shift){
+ if(shift&&last){var b=boxes(),i=b.indexOf(last),j=b.indexOf(x),lo=Math.min(i,j),hi=Math.max(i,j);for(var k=lo;k<=hi;k++)b[k].checked=x.checked;}
+ last=x;scope.value="ids";upd();}
+document.addEventListener("click",function(e){var x=e.target;
+ if(x.classList&&x.classList.contains("mc-sel")){pick(x,e.shiftKey);return;}
+ /* a click anywhere else on a row toggles it, except on links, dropdowns, buttons and forms */
+ var row=x.closest?x.closest(".mc-msg"):null;if(!row)return;
+ if(x.closest("a,button,select,option,input,label,textarea,form,.mc-msg-act"))return;
+ if(window.getSelection&&String(window.getSelection())!=="")return; /* user is selecting text */
+ var c=row.querySelector(".mc-sel");if(!c)return;c.checked=!c.checked;pick(c,e.shiftKey);});
+/* shift-click on a row should not highlight text */
+document.addEventListener("mousedown",function(e){if(e.shiftKey&&e.target.closest&&e.target.closest(".mc-msg")&&!e.target.closest("select,input,a"))e.preventDefault();});
+form.addEventListener("click",function(e){var b=e.target.closest?e.target.closest("button[name=v]"):null;if(b)subv=b.value;});
+if(nw)nw.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();document.getElementById("mcbmove").click();}});
+form.addEventListener("submit",function(e){var sel=boxes().filter(function(x){return x.checked;}).map(function(x){return x.value;});
+ var v=(e.submitter&&e.submitter.value)||subv;
+ if(scope.value!=="all"&&!sel.length){e.preventDefault();alert("Tick at least one message first (click a row).");return;}
+ if(v==="__new"&&!nw.value.trim()){e.preventDefault();alert("Type a folder name first, e.g. Clients/Acme.");nw.focus();return;}
+ ids.value=sel.join(",");
+ var n=scope.value==="all"?nmatch:sel.length;
+ if(v&&n>=50&&!confirm("Change "+n.toLocaleString()+" messages? (Nothing moves until you press Apply.)"))e.preventDefault();});
+upd();})();</script>';
 	mc_foot($js);
 	exit;
 }

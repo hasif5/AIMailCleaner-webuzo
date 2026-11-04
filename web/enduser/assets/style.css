@@ -270,3 +270,78 @@ pre.plain{background:#f7f9fb;color:#1d1d1b;border:1px solid #dfdfdf;max-height:n
 	.mc-msg-act{flex-basis:auto;width:100%;text-align:left}
 	.mc-acts-w,.mc-acts-k{flex-basis:auto}
 }
+
+/* ---- bulk selection + filters (1.1) ---- */
+.mc-filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+.mc-filters select{width:auto;max-width:280px}
+.mc-search{position:relative;flex:1 1 220px;max-width:340px}
+.mc-search i{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#8b8fa3;font-size:12px}
+.mc-search input{padding-left:30px}
+.mc-clear{font-size:12.5px;color:#a92b2b}
+.mc-selbar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:8px 12px;margin:0;
+	border:1px solid #eff2f7;border-bottom:0;border-radius:8px 8px 0 0;background:#f8f9fc;font-size:13px}
+.mc-selall{display:flex;align-items:center;gap:8px;margin:0;cursor:pointer;color:#3d4052;font-weight:500}
+.mc-selall input{margin:0}
+.mc-allmatch{font-size:12.5px;font-weight:600;color:#3453e7}
+.mc-selact{display:none;flex-wrap:wrap;gap:8px;align-items:center;margin-left:auto}
+.mc-selact.on{display:flex}
+.mc-selact label{margin:0;color:#5c6076}
+.mc-selact select{width:auto;max-width:260px}
+.mc-selact input[type=text]{width:220px}
+.mc-selbar+.mc-msgs{border-radius:0 0 8px 8px}
+.mc-msgs{max-height:680px;overflow-y:auto}
+.mc-msg-sel{flex:0 0 auto;padding-top:2px}
+.mc-msg-sel input{margin:0;width:17px;height:17px;cursor:pointer}
+.mc-msg.sel{background:#eef3ff}
+.mc-msg-from a{color:inherit;text-decoration:none;border-bottom:1px dotted #b6bacb}
+.mc-msg-from a:hover{color:#3453e7;border-bottom-color:#3453e7}
+.mc-sticky{position:static}
+@media(max-width:720px){
+	.mc-selact{margin-left:0}
+	.mc-msgs{max-height:none}
+	.mc-msg{flex-direction:row;flex-wrap:wrap}
+	.mc-msg-main{flex:1 1 80%}
+	.mc-msg-act{flex:1 1 100%}
+}
+/* the whole row is a click target for selecting */
+.mc-msg:has(.mc-sel){cursor:pointer}
+.mc-msg .mc-msg-act,.mc-msg a,.mc-msg select{cursor:auto}
+.mc-msg a{cursor:pointer}
+
+/* ---- quick actions on each row + bulk bar (1.1) ---- */
+.mc-msg-act{flex:0 0 360px;text-align:left}
+.mc-qas{display:flex;flex-wrap:wrap;gap:5px;align-items:center;justify-content:flex-end}
+.mc-qas.busy{opacity:.55;pointer-events:none}
+.mc-qas.off{opacity:.5;pointer-events:none}
+.mc-qa{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border:1px solid #d9dce6;border-radius:14px;background:#fff;
+	color:#4a4f66;font-size:12px;font-weight:500;line-height:1.5;cursor:pointer;white-space:nowrap;max-width:180px;overflow:hidden;text-overflow:ellipsis;transition:background .15s,border-color .15s}
+.mc-qa i{font-size:10.5px;opacity:.8}
+.mc-qa:hover{border-color:#3453e7;color:#3453e7}
+.mc-qa.on{color:#fff;border-color:transparent}
+.mc-qa-spam.on{background:#c0392b}
+.mc-qa-keep.on{background:#5c6076}
+.mc-qa-arch.on{background:#1f7a52}
+.mc-qa-ai.on,.mc-qa-rec.on{background:#3453e7}
+.mc-qa-ai:not(.on){border-style:dashed}
+.mc-fbox{position:relative;display:inline-flex;align-items:center;flex:0 1 150px}
+.mc-fbox i{position:absolute;left:8px;font-size:10.5px;color:#8b8fa3;pointer-events:none}
+.mc-fbox input{padding:2px 8px 2px 24px;height:26px;border-radius:14px;font-size:12px;min-width:0}
+.mc-fbox input.on{border-color:#3453e7;background:#eef2ff;color:#1a3fb0;font-weight:600}
+.mc-msg.to-spam{box-shadow:inset 3px 0 0 #e9a3a3}
+.mc-msg.to-folder{box-shadow:inset 3px 0 0 #9db5f2}
+.mc-msg.sel{background:#eef3ff}
+.mc-selact-l{color:#5c6076;font-weight:500}
+.mc-selact .mc-qa{font-size:12.5px;padding:4px 11px}
+.mc-selact .mc-fbox{flex:0 1 220px}
+.mc-selact .mc-fbox input{height:28px}
+@media(max-width:720px){
+	.mc-msg-act{flex:1 1 100%}
+	.mc-qas{justify-content:flex-start}
+}
+
+/* ---- check limits + stop */
+.mc-checkrow form{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.mc-lim{display:inline-flex;align-items:center;gap:6px;margin:0;font-size:14px;color:#555}
+.mc-lim input{width:96px;display:inline-block;padding:4px 8px;height:auto}
+.mc-stoprow{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:10px 0 4px}
+.mc-stoprow .hint{margin:0}

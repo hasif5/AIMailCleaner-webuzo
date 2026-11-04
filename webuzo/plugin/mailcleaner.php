@@ -2,7 +2,7 @@
 /*
 Plugin Name: AI Mail Cleaner
 Description: Finds spam and phishing in mailboxes with SpamAssassin plus AI (Google Gemini, optional Anthropic Claude), files mail into the right folders, and never deletes anything. Powered by Digitalbkk Co., Ltd.
-Version: 1.0.1
+Version: 1.1.0
 Plugin URI: https://github.com/hasif5/AIMailCleaner-webuzo
 Author: Hasif Ahmed <hasif5@gmail.com> — developed by the Digitalbkk team
 Author URI: https://www.digitalbkk.com
